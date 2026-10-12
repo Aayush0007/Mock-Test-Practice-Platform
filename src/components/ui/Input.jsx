@@ -1,0 +1,20 @@
+export default function Input({
+  label,
+  error,
+  className = '',
+  id,
+  ...props
+}) {
+  const inputId = id || props.name
+  return (
+    <div className={className}>
+      {label && (
+        <label htmlFor={inputId} className="label">
+          {label}
+        </label>
+      )}
+      <input id={inputId} className={`input ${error ? 'border-red-500' : ''}`} {...props} />
+      {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+    </div>
+  )
+}
