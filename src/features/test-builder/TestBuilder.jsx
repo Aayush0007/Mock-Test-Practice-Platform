@@ -15,7 +15,7 @@ import Badge from '../../components/ui/Badge'
 import Input from '../../components/ui/Input'
 import Select from '../../components/ui/Select'
 import Spinner from '../../components/ui/Spinner'
-import { getTest, saveTest } from '../../services/storage/db'
+import { getTest, saveTest, getImage } from '../../services/storage/db'
 import { useAppStore } from '../../stores/appStore'
 import { formatTime } from '../../utils/scoring'
 import { generateId } from '../../utils/id'
@@ -30,6 +30,7 @@ export default function TestBuilder() {
   const [saving, setSaving] = useState(false)
   const [selectedQuestionId, setSelectedQuestionId] = useState(null)
   const [activeTab, setActiveTab] = useState('questions') // questions | sections | config
+  const [questionImages, setQuestionImages] = useState([]) // loaded dataURLs for selected Q
 
   useEffect(() => {
     async function load() {
@@ -55,6 +56,31 @@ export default function TestBuilder() {
   }, [testId])
 
   const selectedQuestion = test?.questions?.find((q) => q.id === selectedQuestionId)
+
+  // Load images for the selected question
+  useEffect(() => {
+    let cancelled = false
+    async function loadImages() {
+      if (!selectedQuestion?.imageIds?.length) {
+        setQuestionImages([])
+        return
+      }
+      const loaded = []
+      for (const id of selectedQuestion.imageIds) {
+        try {
+          const img = await getImage(id)
+          if (img?.dataUrl) loaded.push(img)
+        } catch {
+          // ignore missing
+        }
+      }
+      if (!cancelled) setQuestionImages(loaded)
+    }
+    loadImages()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedQuestionId, selectedQuestion?.imageIds])
 
   const updateQuestion = (field, value) => {
     setTest((prev) => ({
@@ -338,7 +364,40 @@ export default function TestBuilder() {
                       onChange={(e) => updateQuestion('text', e.target.value)}
                       placeholder="Enter question text..."
                     />
+                    {selectedQuestion.sourcePage && (
+                      <p className="text-xs text-slate-400 mt-1">
+                        Source page: {selectedQuestion.sourcePage}
+                        {selectedQuestion.imageIds?.length
+                          ? ` · ${selectedQuestion.imageIds.length} linked image(s)`
+                          : ''}
+                      </p>
+                    )}
                   </div>
+
+                  {/* DI / chart / diagram images */}
+                  {questionImages.length > 0 && (
+                    <div>
+                      <label className="label">Linked images / charts (DI)</label>
+                      <div className="space-y-2">
+                        {questionImages.map((img) => (
+                          <div
+                            key={img.id}
+                            className="border border-slate-200 rounded-lg p-2 bg-slate-50"
+                          >
+                            <img
+                              src={img.dataUrl}
+                              alt={`Page ${img.pageNumber} figure`}
+                              className="max-w-full h-auto rounded max-h-64 mx-auto"
+                            />
+                            <p className="text-xs text-slate-400 text-center mt-1">
+                              Page {img.pageNumber}
+                              {img.isPageRender ? ' (page render)' : ''}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div>
                     <label className="label">Options</label>

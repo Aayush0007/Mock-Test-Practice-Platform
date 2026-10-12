@@ -1,5 +1,31 @@
 import { useTestStore } from '../../../stores/testStore'
 
+/** Render text with **bold** markers as <strong> */
+function FormattedText({ text, className = '' }) {
+  if (!text) return null
+  // Split on **...** pairs
+  const parts = []
+  const re = /\*\*(.+?)\*\*/g
+  let last = 0
+  let m
+  let key = 0
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      parts.push(<span key={key++}>{text.slice(last, m.index)}</span>)
+    }
+    parts.push(
+      <strong key={key++} className="font-bold text-slate-900 bg-yellow-100 px-0.5 rounded-sm">
+        {m[1]}
+      </strong>
+    )
+    last = m.index + m[0].length
+  }
+  if (last < text.length) {
+    parts.push(<span key={key++}>{text.slice(last)}</span>)
+  }
+  return <span className={className}>{parts.length ? parts : text}</span>
+}
+
 export default function QuestionPanel() {
   const getCurrentQuestion = useTestStore((s) => s.getCurrentQuestion)
   const tempSelection = useTestStore((s) => s.tempSelection)
@@ -15,7 +41,6 @@ export default function QuestionPanel() {
     )
   }
 
-  // Display temp selection, or fall back to saved response
   const selected =
     tempSelection !== null ? tempSelection : responses[question.id] ?? null
 
@@ -28,8 +53,8 @@ export default function QuestionPanel() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        <p className="text-slate-900 whitespace-pre-wrap leading-relaxed mb-6">
-          {question.text}
+        <p className="text-slate-900 whitespace-pre-wrap leading-relaxed mb-6 text-[15px]">
+          <FormattedText text={question.text} />
         </p>
 
         <div className="space-y-2">
@@ -38,6 +63,7 @@ export default function QuestionPanel() {
             return (
               <button
                 key={opt.label}
+                type="button"
                 onClick={() => setTempSelection(opt.label)}
                 className={`w-full flex items-start gap-3 p-3 rounded-lg border text-left transition-colors ${
                   isSelected
@@ -54,7 +80,9 @@ export default function QuestionPanel() {
                 >
                   {opt.label}
                 </span>
-                <span className="text-sm text-slate-800 pt-0.5">{opt.text}</span>
+                <span className="text-sm text-slate-800 pt-0.5">
+                  <FormattedText text={opt.text} />
+                </span>
               </button>
             )
           })}

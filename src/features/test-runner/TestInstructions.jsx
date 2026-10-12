@@ -65,6 +65,14 @@ export default function TestInstructions() {
 
     try {
       await saveAttempt(attempt)
+      // Enter fullscreen like a real CBT lab
+      try {
+        const el = document.documentElement
+        if (el.requestFullscreen) await el.requestFullscreen()
+        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen()
+      } catch {
+        // User may deny; test still runs
+      }
       startAttempt({ attemptId, test })
       navigate(`/test/${test.id}/attempt/${attemptId}`)
     } catch (err) {

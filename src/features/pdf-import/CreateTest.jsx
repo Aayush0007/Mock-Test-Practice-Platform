@@ -7,7 +7,7 @@ import Select from '../../components/ui/Select'
 import Input from '../../components/ui/Input'
 import { EXAM_CONFIGS, getExamById } from '../../config/exams'
 import { parsePDF } from '../../services/pdf/parser'
-import { saveTest } from '../../services/storage/db'
+import { saveTest, saveImage } from '../../services/storage/db'
 import { generateId } from '../../utils/id'
 import { useAppStore } from '../../stores/appStore'
 import { getErrorMessage } from '../../utils/errors'
@@ -123,6 +123,29 @@ export default function CreateTest() {
     }
 
     try {
+      const testId = generateId()
+
+      // Persist extracted images (DI charts, graphs, diagrams) to IndexedDB
+      const imageIdMap = {} // old parser id → stable storage id
+      const extractedImages = parseResult?.images || []
+      for (const img of extractedImages) {
+        const storageId = generateId()
+        imageIdMap[img.id] = storageId
+        await saveImage({
+          id: storageId,
+          testId,
+          pageNumber: img.pageNumber,
+          width: img.width,
+          height: img.height,
+          dataUrl: img.dataUrl,
+          name: img.name || img.id,
+          isPageRender: !!img.isPageRender,
+        })
+      }
+
+      const remapImageIds = (ids = []) =>
+        ids.map((id) => imageIdMap[id] || id).filter(Boolean)
+
       const questions = (parseResult?.questions || []).map((q, idx) => ({
         id: generateId(),
         number: q.number || idx + 1,
@@ -135,49 +158,61 @@ export default function CreateTest() {
         positiveMarks: examConfig.sections[0]?.positiveMarks ?? 1,
         negativeMarks: examConfig.sections[0]?.negativeMarks ?? 0.25,
         sharedContentId: q.sharedContentId || null,
-        imageIds: q.imageIds || [],
+        imageIds: remapImageIds(q.imageIds || []),
         sourcePage: q.sourcePage || null,
         validationStatus: q.text ? 'ok' : 'incomplete',
       }))
 
-      // Distribute questions across sections based on expected counts
-      let qIdx = 0
-      const sections = examConfig.sections.map((sec) => {
-        const count = Math.min(sec.expectedQuestions, questions.length - qIdx)
-        const sectionQuestions = questions.slice(qIdx, qIdx + count)
-        sectionQuestions.forEach((q) => {
-          q.sectionId = sec.id
-          q.positiveMarks = sec.positiveMarks
-          q.negativeMarks = sec.negativeMarks
-        })
-        qIdx += count
+      // Shared passages / Directions (linked to question number ranges)
+      const passages = (parseResult?.passages || []).map((p) => ({
+        id: p.id,
+        text: p.text,
+        from: p.from,
+        to: p.to,
+        pageNumber: p.pageNumber,
+        imageIds: remapImageIds(p.imageIds || []),
+      }))
+
+      // Assign sections by QUESTION NUMBER ranges (not sequential fill).
+      // SBI/IBPS Prelims: Q1–30 English, Q31–65 Quant, Q66–100 Reasoning.
+      // Using number ranges prevents quant questions from landing in English
+      // when some earlier questions failed to extract.
+      const sortedSecs = [...examConfig.sections].sort((a, b) => a.order - b.order)
+      let rangeStart = 1
+      const sectionRanges = sortedSecs.map((sec) => {
+        const start = rangeStart
+        const end = rangeStart + sec.expectedQuestions - 1
+        rangeStart = end + 1
+        return { ...sec, rangeStart: start, rangeEnd: end }
+      })
+
+      for (const q of questions) {
+        const n = q.number
+        const match =
+          sectionRanges.find((s) => n >= s.rangeStart && n <= s.rangeEnd) ||
+          sectionRanges[sectionRanges.length - 1]
+        q.sectionId = match.id
+        q.positiveMarks = match.positiveMarks
+        q.negativeMarks = match.negativeMarks
+      }
+
+      const sections = sectionRanges.map((sec) => {
+        const actual = questions.filter((q) => q.sectionId === sec.id).length
         return {
           id: sec.id,
           name: sec.name,
           order: sec.order,
           durationSeconds: sec.durationSeconds,
           expectedQuestions: sec.expectedQuestions,
-          actualQuestions: sectionQuestions.length,
+          actualQuestions: actual,
           positiveMarks: sec.positiveMarks,
           negativeMarks: sec.negativeMarks,
-          maxMarks: sectionQuestions.length * sec.positiveMarks,
+          maxMarks: actual * sec.positiveMarks,
         }
       })
 
-      // Assign remaining questions to last section
-      if (qIdx < questions.length) {
-        const lastSec = sections[sections.length - 1]
-        questions.slice(qIdx).forEach((q) => {
-          q.sectionId = lastSec.id
-          q.positiveMarks = lastSec.positiveMarks
-          q.negativeMarks = lastSec.negativeMarks
-        })
-        lastSec.actualQuestions = questions.filter((q) => q.sectionId === lastSec.id).length
-        lastSec.maxMarks = lastSec.actualQuestions * lastSec.positiveMarks
-      }
-
       const test = {
-        id: generateId(),
+        id: testId,
         title: testTitle.trim(),
         examId: examConfig.id,
         examName: examConfig.name,
@@ -188,6 +223,7 @@ export default function CreateTest() {
         sourceFileSize: file.size,
         sections,
         questions,
+        passages,
         totalQuestions: questions.length,
         maxMarks: sections.reduce((s, sec) => s + sec.maxMarks, 0),
         answerKeyStatus: questions.some((q) => q.correctAnswer)
@@ -196,11 +232,16 @@ export default function CreateTest() {
             : 'partial'
           : 'missing',
         parsingWarnings: parseResult?.warnings || [],
+        imageCount: extractedImages.length,
         status: 'draft',
       }
 
       await saveTest(test)
-      addToast({ type: 'success', title: 'Test created', message: 'Review and edit questions before starting.' })
+      addToast({
+        type: 'success',
+        title: 'Test created',
+        message: `${questions.length} questions, ${extractedImages.length} image(s). Review before starting.`,
+      })
       navigate(`/builder/${test.id}`)
     } catch (err) {
       console.error(err)

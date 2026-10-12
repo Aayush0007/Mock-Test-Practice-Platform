@@ -1,298 +1,526 @@
 /**
- * PDF text extraction and basic question parsing using PDF.js.
- * This is a best-effort parser — human review is always required.
+ * Fast PDF parser for banking/SSC mocks (Adda247 style)
+ *
+ * - Text-only (fast)
+ * - Global Q1..Q100 detection
+ * - Directions (1-5) linked to questions in range
+ * - Robust answer key: S1. Ans.(e) / S1.Ans.(e) / Correct Answer: (e)
  */
 
 import * as pdfjsLib from 'pdfjs-dist'
 import { PDFParseError } from '../../utils/errors'
 import { EXAM_CONFIGS } from '../../config/exams'
 
-// Set worker source for PDF.js
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
 ).toString()
 
+const yieldToUI = () => new Promise((r) => setTimeout(r, 0))
+
+// ---------------------------------------------------------------------------
+// Text extraction
+// ---------------------------------------------------------------------------
+
+function isBoldFont(fontName) {
+  if (!fontName) return false
+  const n = String(fontName).toLowerCase()
+  return (
+    n.includes('bold') ||
+    n.includes('black') ||
+    n.includes('heavy') ||
+    n.includes('semibold') ||
+    n.includes('demibold')
+  )
+}
+
+function reconstructPageText(textContent) {
+  const items = (textContent.items || []).filter(
+    (it) => it && typeof it.str === 'string' && it.str.length > 0
+  )
+  if (!items.length) return { text: '', lines: [] }
+
+  const styles = textContent.styles || {}
+  const enriched = items.map((it) => {
+    const t = it.transform || [1, 0, 0, 1, 0, 0]
+    const fontKey = it.fontName || it.font || ''
+    const style = styles[fontKey] || {}
+    const fontName = style.fontFamily || style.fontName || fontKey || ''
+    // Bold if font name says so, OR font weight is heavy, OR this glyph is denser (heuristic)
+    const bold =
+      isBoldFont(fontName) ||
+      isBoldFont(fontKey) ||
+      (style.fontWeight && Number(style.fontWeight) >= 600)
+    return {
+      str: it.str,
+      x: t[4],
+      y: t[5],
+      height: Math.abs(t[3]) || Math.abs(it.height) || 10,
+      width: it.width || 0,
+      bold: !!bold,
+    }
+  })
+
+  enriched.sort((a, b) => {
+    const dy = b.y - a.y
+    if (Math.abs(dy) > 2) return dy
+    return a.x - b.x
+  })
+
+  const lines = []
+  let row = []
+  let rowY = null
+  let rowH = 10
+
+  for (const it of enriched) {
+    const thresh = Math.max(it.height, rowH) * 0.5
+    if (rowY === null || Math.abs(it.y - rowY) <= thresh) {
+      row.push(it)
+      rowY = rowY === null ? it.y : (rowY + it.y) / 2
+      rowH = it.height
+    } else {
+      lines.push(mergeRow(row))
+      row = [it]
+      rowY = it.y
+      rowH = it.height
+    }
+  }
+  if (row.length) lines.push(mergeRow(row))
+  return { text: lines.join('\n'), lines }
+}
+
 /**
- * Extract text content from every page of a PDF.
+ * Merge a row of text items. Bold runs are wrapped in **...** for later rendering.
  */
-async function extractTextFromPDF(file, onProgress) {
+function mergeRow(items) {
+  items.sort((a, b) => a.x - b.x)
+  let s = ''
+  let inBold = false
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
+    if (i > 0) {
+      const prev = items[i - 1]
+      const gap = it.x - (prev.x + (prev.width || 0))
+      if (gap > (prev.height || 10) * 0.12 && !s.endsWith(' ') && !it.str.startsWith(' ')) {
+        // Close bold before space if needed, then reopen
+        if (inBold && !it.bold) {
+          s += '**'
+          inBold = false
+        }
+        s += ' '
+      }
+    }
+
+    if (it.bold && !inBold) {
+      s += '**'
+      inBold = true
+    } else if (!it.bold && inBold) {
+      s += '**'
+      inBold = false
+    }
+    s += it.str
+  }
+  if (inBold) s += '**'
+  return s.replace(/[ \t]+/g, ' ').replace(/\*\*\s+\*\*/g, ' ').trim()
+}
+
+async function extractTextOnly(file, onProgress) {
   const arrayBuffer = await file.arrayBuffer()
   let pdf
-
   try {
     pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
   } catch (err) {
     if (err?.name === 'PasswordException') {
-      throw new PDFParseError('This PDF is password-protected and cannot be processed.')
+      throw new PDFParseError('This PDF is password-protected.')
     }
-    throw new PDFParseError('Failed to open PDF. The file may be corrupted.')
+    throw new PDFParseError('Failed to open PDF. File may be corrupted.')
   }
 
   const numPages = pdf.numPages
   const pages = []
-  let totalTextLength = 0
+  let totalText = 0
 
   for (let i = 1; i <= numPages; i++) {
     const page = await pdf.getPage(i)
     const content = await page.getTextContent()
-    const text = content.items.map((item) => item.str).join(' ')
-    pages.push({ pageNumber: i, text })
-    totalTextLength += text.trim().length
+    const { text, lines } = reconstructPageText(content)
+    pages.push({ pageNumber: i, text, lines })
+    totalText += text.trim().length
 
     if (onProgress) {
-      onProgress(Math.round((i / numPages) * 40), `Reading page ${i} of ${numPages}...`)
+      onProgress(Math.round((i / numPages) * 50), `Reading page ${i} of ${numPages}...`)
     }
+    if (i % 3 === 0) await yieldToUI()
   }
 
-  // Detect scanned/image-only PDF
-  if (totalTextLength < 50) {
+  if (totalText < 40) {
     throw new PDFParseError(
-      'This appears to be a scanned (image-only) PDF. Text extraction failed. OCR support can be enabled in a future update. Please use a text-based PDF for now.'
+      'Very little text found. This may be a scanned PDF. Please use a text-based PDF.'
     )
   }
 
-  return { pages, numPages, fullText: pages.map((p) => p.text).join('\n') }
+  return {
+    pages,
+    numPages,
+    fullText: pages.map((p) => p.text).join('\n\n'),
+  }
 }
 
-/**
- * Attempt to detect examination type from text.
- */
+// ---------------------------------------------------------------------------
+// Exam detection
+// ---------------------------------------------------------------------------
+
 function detectExam(fullText) {
   const lower = fullText.toLowerCase()
-
-  const patterns = [
-    { keywords: ['sbi clerk', 'preliminary'], id: 'sbi-clerk-prelims' },
-    { keywords: ['sbi clerk', 'main'], id: 'sbi-clerk-mains' },
-    { keywords: ['sbi po', 'preliminary'], id: 'sbi-po-prelims' },
-    { keywords: ['sbi po', 'main'], id: 'sbi-po-mains' },
-    { keywords: ['ibps clerk', 'preliminary'], id: 'ibps-clerk-prelims' },
-    { keywords: ['ibps clerk', 'main'], id: 'ibps-clerk-mains' },
-    { keywords: ['ibps po', 'preliminary'], id: 'ibps-po-prelims' },
-    { keywords: ['ibps po', 'main'], id: 'ibps-po-mains' },
-    { keywords: ['ibps rrb', 'clerk', 'preliminary'], id: 'ibps-rrb-clerk-prelims' },
-    { keywords: ['ibps rrb', 'clerk', 'main'], id: 'ibps-rrb-clerk-mains' },
-    { keywords: ['ibps rrb', 'officer', 'preliminary'], id: 'ibps-rrb-po-prelims' },
-    { keywords: ['ibps rrb', 'officer', 'main'], id: 'ibps-rrb-po-mains' },
-    { keywords: ['ssc cgl', 'tier-i', 'tier 1', 'tier-1'], id: 'ssc-cgl-tier1' },
-    { keywords: ['ssc cgl', 'tier-ii', 'tier 2', 'tier-2'], id: 'ssc-cgl-tier2' },
-    { keywords: ['ibps so', 'preliminary'], id: 'ibps-so-prelims' },
-    { keywords: ['ibps so', 'it officer', 'professional knowledge'], id: 'ibps-so-mains-it' },
-  ]
-
-  for (const pattern of patterns) {
-    if (pattern.keywords.every((kw) => lower.includes(kw))) {
-      return pattern.id
-    }
-  }
-
-  // Fallback: match by provider + name only
+  if (/sbi\s*clerk/i.test(lower) && /pre/i.test(lower)) return 'sbi-clerk-prelims'
+  if (/sbi\s*clerk/i.test(lower) && /main/i.test(lower)) return 'sbi-clerk-mains'
+  if (/sbi\s*po/i.test(lower) && /pre/i.test(lower)) return 'sbi-po-prelims'
+  if (/sbi\s*po/i.test(lower) && /main/i.test(lower)) return 'sbi-po-mains'
+  if (/ibps\s*clerk/i.test(lower) && /pre/i.test(lower)) return 'ibps-clerk-prelims'
+  if (/ibps\s*clerk/i.test(lower) && /main/i.test(lower)) return 'ibps-clerk-mains'
+  if (/ibps\s*po/i.test(lower) && /pre/i.test(lower)) return 'ibps-po-prelims'
+  if (/ibps\s*po/i.test(lower) && /main/i.test(lower)) return 'ibps-po-mains'
+  if (/ssc\s*cgl/i.test(lower)) return 'ssc-cgl-tier1'
   for (const exam of EXAM_CONFIGS) {
-    const nameLower = exam.name.toLowerCase()
-    const stageLower = exam.stage.toLowerCase()
-    if (lower.includes(nameLower) && lower.includes(stageLower.split(' ')[0])) {
-      return exam.id
-    }
+    if (lower.includes(exam.name.toLowerCase())) return exam.id
   }
-
   return null
 }
 
-/**
- * Extract questions using heuristic pattern matching.
- * Looks for numbered questions and option patterns (A) (B) (C) (D) etc.
- */
-function extractQuestions(pages, onProgress) {
-  const questions = []
-  const warnings = []
-  const fullText = pages.map((p) => p.text).join('\n\n')
+// ---------------------------------------------------------------------------
+// Directions / passages: "Directions (1-5): ..." → questions 1..5
+// ---------------------------------------------------------------------------
 
-  // Split by common question number patterns
-  // Matches: "1.", "Q.1", "Q1.", "Question 1", "(1)", etc.
-  const questionPattern =
-    /(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})[.)\]]\s+/gi
+function extractDirections(fullText, pages) {
+  const passages = []
+  // Directions (1-5): or Directions (23-30): or Direction (1-5)
+  const re =
+    /Directions?\s*\(\s*(\d{1,3})\s*[-–—to]+\s*(\d{1,3})\s*\)\s*[:.]?\s*/gi
+  const matches = [...fullText.matchAll(re)]
 
-  const parts = fullText.split(questionPattern)
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i]
+    const from = parseInt(m[1], 10)
+    const to = parseInt(m[2], 10)
+    if (from < 1 || to < from || to > 250) continue
 
-  // parts alternates: [preamble, num1, text1, num2, text2, ...]
-  if (parts.length < 3) {
-    warnings.push(
-      'Could not reliably detect question numbering. Please add questions manually or correct extraction.'
+    const contentStart = m.index + m[0].length
+    // End at next Directions or first question after range, or next big Q marker
+    const nextDir = matches[i + 1]?.index ?? fullText.length
+    // Also stop before Q{from} if the direction text is short instructions only
+    let contentEnd = nextDir
+    // Prefer stopping at Q{from} so passage doesn't swallow questions
+    const qMarker = new RegExp(
+      `(?:^|[\\n\\r])\\s*Q\\.?\\s*${from}\\s*[.)]`,
+      'i'
     )
-    // Try a simpler approach: look for option patterns
-    return { questions: [], warnings }
+    const qMatch = fullText.slice(contentStart, nextDir).match(qMarker)
+    if (qMatch && qMatch.index != null) {
+      contentEnd = contentStart + qMatch.index
+    }
+
+    let text = fullText.slice(contentStart, contentEnd).trim()
+    // Keep a reasonable length; include passage body for RC
+    if (text.length > 8000) text = text.slice(0, 8000)
+
+    // Skip tiny/empty
+    if (text.length < 10) continue
+
+    const id = `dir-${from}-${to}`
+    passages.push({
+      id,
+      text: `Directions (${from}-${to}): ${text}`,
+      from,
+      to,
+      pageNumber: pageForIndex(pages, m.index),
+      imageIds: [],
+    })
   }
 
-  for (let i = 1; i < parts.length - 1; i += 2) {
-    const number = parseInt(parts[i], 10)
-    const rawText = (parts[i + 1] || '').trim()
+  return passages
+}
 
-    if (!rawText || rawText.length < 10) continue
+function pageForIndex(pages, index) {
+  let offset = 0
+  for (const page of pages) {
+    const len = (page.text || '').length + 2
+    if (index < offset + len) return page.pageNumber
+    offset += len
+  }
+  return pages[pages.length - 1]?.pageNumber || null
+}
 
-    // Extract options
-    const { text, options } = parseOptions(rawText)
+// ---------------------------------------------------------------------------
+// Question starts
+// ---------------------------------------------------------------------------
+
+function findAllQuestionStarts(fullText) {
+  const starts = []
+  const reQ = /(?:^|[\n\r])\s*(Q\.?\s*)(\d{1,3})\s*[.)]\s*/gi
+  let m
+  while ((m = reQ.exec(fullText)) !== null) {
+    const number = parseInt(m[2], 10)
+    if (!number || number < 1 || number > 250) continue
+    const after = fullText.slice(m.index, m.index + 50)
+    if (/\bAns\.?\b/i.test(after)) continue
+    // Skip solution section "S12." that might look odd
+    starts.push({
+      number,
+      index: m.index,
+      contentStart: m.index + m[0].length,
+    })
+  }
+
+  const foundNums = new Set(starts.map((s) => s.number))
+  const rePlain = /(?:^|[\n\r])\s*(\d{1,3})[.)]\s+(?=[A-Za-z(])/g
+  while ((m = rePlain.exec(fullText)) !== null) {
+    const number = parseInt(m[1], 10)
+    if (!number || number < 1 || number > 250) continue
+    if (foundNums.has(number)) continue
+    const after = fullText.slice(m.index, m.index + 50)
+    if (/\bAns\.?\b/i.test(after)) continue
+    const before = fullText.slice(Math.max(0, m.index - 2), m.index + 4)
+    if (/S\d/i.test(before)) continue
+    starts.push({ number, index: m.index, contentStart: m.index + m[0].length })
+    foundNums.add(number)
+  }
+
+  starts.sort((a, b) => a.index - b.index)
+  const byNum = new Map()
+  for (const s of starts) {
+    if (!byNum.has(s.number)) byNum.set(s.number, s)
+  }
+  return [...byNum.values()].sort((a, b) => a.index - b.index)
+}
+
+function parseOptions(block) {
+  let matches = [...block.matchAll(/(?:^|[\n\r])\s*\(([a-eA-E])\)\s+/g)]
+  if (matches.length < 2) {
+    matches = [...block.matchAll(/(?:^|[\n\r])\s*([a-eA-E])[.)]\s+/g)]
+  }
+  if (matches.length < 2) {
+    matches = [...block.matchAll(/\(([a-eA-E])\)\s+/g)]
+  }
+
+  if (matches.length < 2) {
+    return { text: block.trim(), options: emptyOptions(), hasOptions: false }
+  }
+
+  const qText = block.slice(0, matches[0].index).trim()
+  const options = []
+  const seen = new Set()
+
+  for (let i = 0; i < matches.length; i++) {
+    const label = matches[i][1].toUpperCase()
+    if (seen.has(label)) continue
+    seen.add(label)
+    const start = matches[i].index + matches[i][0].length
+    const end = i + 1 < matches.length ? matches[i + 1].index : block.length
+    let optText = block.slice(start, end).trim()
+    optText = optText
+      .split(/(?=\n\s*Q\.?\s*\d|\n\s*Directions?\s*[:(\d]|\n\s*S\d+\.?\s*Ans)/i)[0]
+      .trim()
+    options.push({ label, text: optText })
+  }
+
+  const order = ['A', 'B', 'C', 'D', 'E']
+  options.sort((a, b) => order.indexOf(a.label) - order.indexOf(b.label))
+
+  return {
+    text: qText || block.trim(),
+    options: options.length >= 2 ? options : emptyOptions(),
+    hasOptions: options.length >= 2,
+  }
+}
+
+function emptyOptions() {
+  return [
+    { label: 'A', text: '' },
+    { label: 'B', text: '' },
+    { label: 'C', text: '' },
+    { label: 'D', text: '' },
+    { label: 'E', text: '' },
+  ]
+}
+
+function extractQuestions(pages, fullText, passages, onProgress) {
+  const warnings = []
+  const starts = findAllQuestionStarts(fullText)
+  if (onProgress) onProgress(60, `Located ${starts.length} question markers...`)
+
+  const questions = []
+
+  for (let i = 0; i < starts.length; i++) {
+    const s = starts[i]
+    const end = i + 1 < starts.length ? starts[i + 1].index : fullText.length
+    let block = fullText.slice(s.contentStart, end).trim()
+    // Don't include following Directions in the question body
+    block = block.split(/(?=\n\s*Directions?\s*[:(\d])/i)[0].trim()
+    if (!block || block.length < 3) continue
+
+    const { text, options, hasOptions } = parseOptions(block)
+
+    // Link to Directions range
+    let sharedContentId = null
+    for (const p of passages) {
+      if (s.number >= p.from && s.number <= p.to) {
+        sharedContentId = p.id
+        break
+      }
+    }
 
     questions.push({
-      number,
-      text: text.trim(),
+      number: s.number,
+      text: text || block,
       type: 'mcq',
       options,
+      hasOptions,
       correctAnswer: null,
       explanation: null,
-      sourcePage: null,
+      sourcePage: pageForIndex(pages, s.index),
+      imageIds: [],
+      sharedContentId,
     })
-
-    if (onProgress && questions.length % 10 === 0) {
-      onProgress(
-        40 + Math.min(40, Math.round((questions.length / 100) * 40)),
-        `Extracted ${questions.length} questions...`
-      )
-    }
   }
 
-  // Deduplicate by number (keep first occurrence)
+  questions.sort((a, b) => a.number - b.number)
   const seen = new Set()
   const unique = []
   for (const q of questions) {
-    if (!seen.has(q.number)) {
-      seen.add(q.number)
-      unique.push(q)
-    }
+    if (seen.has(q.number)) continue
+    seen.add(q.number)
+    unique.push(q)
   }
+
+  if (onProgress) onProgress(72, `Extracted ${unique.length} questions...`)
 
   if (unique.length === 0) {
-    warnings.push('No questions could be extracted automatically.')
-  } else if (unique.length < 10) {
-    warnings.push(
-      `Only ${unique.length} questions were detected. Please verify and add missing questions.`
-    )
+    warnings.push('No questions detected. Add them manually in the builder.')
   }
 
-  // Check for missing numbers
-  if (unique.length > 0) {
-    const numbers = unique.map((q) => q.number).sort((a, b) => a - b)
+  if (unique.length > 2) {
+    const nums = unique.map((q) => q.number)
+    const min = nums[0]
+    const max = nums[nums.length - 1]
     const missing = []
-    for (let n = numbers[0]; n <= numbers[numbers.length - 1]; n++) {
-      if (!numbers.includes(n)) missing.push(n)
+    for (let n = min; n <= max; n++) {
+      if (!seen.has(n)) missing.push(n)
     }
-    if (missing.length > 0 && missing.length <= 20) {
+    if (missing.length > 0 && missing.length <= 40) {
       warnings.push(`Missing question numbers: ${missing.join(', ')}`)
     }
+  }
+
+  const noOpt = unique.filter((q) => !q.hasOptions).length
+  if (noOpt > 0) {
+    warnings.push(`${noOpt} question(s) missing clear options — blank A–E placeholders added.`)
+  }
+
+  const linked = unique.filter((q) => q.sharedContentId).length
+  if (linked > 0) {
+    warnings.push(`${linked} question(s) linked to Directions/passage panels.`)
   }
 
   return { questions: unique, warnings }
 }
 
-/**
- * Parse options from question text.
- * Supports patterns like: (a) ... (b) ..., A. ... B. ..., 1) ... 2) ...
- */
-function parseOptions(rawText) {
-  // Try pattern: (A) or (a) or A) or A. or a)
-  const optionPattern =
-    /(?:^|\s)[\(]?([A-Da-d])[\).]\s+/g
+// ---------------------------------------------------------------------------
+// Answer key — scan FULL document, multiple patterns
+// ---------------------------------------------------------------------------
 
-  const matches = [...rawText.matchAll(optionPattern)]
-
-  if (matches.length < 2) {
-    // No clear options found
-    return { text: rawText, options: [] }
-  }
-
-  const options = []
-  let questionText = rawText.slice(0, matches[0].index).trim()
-
-  for (let i = 0; i < matches.length; i++) {
-    const label = matches[i][1].toUpperCase()
-    const start = matches[i].index + matches[i][0].length
-    const end = i + 1 < matches.length ? matches[i + 1].index : rawText.length
-    const optionText = rawText.slice(start, end).trim()
-    // Stop if we hit next question or answer key
-    const cleaned = optionText.split(/\n\s*(?:\d+[.)]|Q\.?\s*\d)/)[0].trim()
-    options.push({ label, text: cleaned })
-  }
-
-  return { text: questionText, options }
-}
-
-/**
- * Attempt to extract answer key from the end of the document.
- */
 function extractAnswerKey(pages) {
   const answerKey = {}
-  const lastPages = pages.slice(-5) // Check last 5 pages
-  const text = lastPages.map((p) => p.text).join('\n')
+  // Solutions often start mid-PDF; scan everything after page 1
+  const text = pages.map((p) => p.text).join('\n')
 
-  // Look for answer key heading
-  const hasAnswerKey =
-    /answer\s*key|answers?\s*:|correct\s*answers?|solutions?/i.test(text)
-
-  if (!hasAnswerKey) return { answerKey, found: false }
-
-  // Pattern: 1. A  or  1-A  or  1) A  or  Q1. A
+  // Pattern 1: S1. Ans.(e)  S1.Ans.(e)  S1. Ans. (e)  S1 Ans (e)
   const patterns = [
-    /(?:Q\.?\s*)?(\d{1,3})\s*[.):\-–]\s*([A-Da-d])/gi,
-    /(\d{1,3})\s+([A-Da-d])(?:\s|$)/gi,
+    /S\s*(\d{1,3})\s*\.?\s*Ans\.?\s*\(?\s*([a-eA-E])\s*\)?/gi,
+    // S1. (e) at line start in solutions
+    /(?:^|[\n\r])\s*S\s*(\d{1,3})\s*\.?\s*\(\s*([a-eA-E])\s*\)/gi,
+    // Correct Answer: (e) after Sxx context — handled below per block
   ]
 
-  for (const pattern of patterns) {
-    let match
-    while ((match = pattern.exec(text)) !== null) {
-      const num = parseInt(match[1], 10)
-      const ans = match[2].toUpperCase()
-      if (num > 0 && num <= 300 && !answerKey[num]) {
+  for (const re of patterns) {
+    let m
+    const r = new RegExp(re.source, re.flags)
+    while ((m = r.exec(text)) !== null) {
+      const num = parseInt(m[1], 10)
+      const ans = m[2].toUpperCase()
+      if (num >= 1 && num <= 300 && !answerKey[num]) {
         answerKey[num] = ans
       }
+    }
+  }
+
+  // Pattern: blocks "S12. ... Correct Answer: (d)"
+  const blockRe = /S\s*(\d{1,3})\s*\.[\s\S]{0,1200}?Correct\s*Answer\s*[:.]?\s*\(?\s*([a-eA-E])\s*\)?/gi
+  let m
+  while ((m = blockRe.exec(text)) !== null) {
+    const num = parseInt(m[1], 10)
+    const ans = m[2].toUpperCase()
+    if (num >= 1 && num <= 300) {
+      // Prefer explicit Ans.(x) already set; else use Correct Answer
+      if (!answerKey[num]) answerKey[num] = ans
     }
   }
 
   return { answerKey, found: Object.keys(answerKey).length > 0 }
 }
 
-/**
- * Main entry point: parse a PDF file into structured question data.
- */
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 export async function parsePDF(file, { onProgress } = {}) {
-  if (onProgress) onProgress(5, 'Opening PDF...')
+  if (onProgress) onProgress(1, 'Opening PDF...')
 
-  const { pages, numPages, fullText } = await extractTextFromPDF(file, onProgress)
+  const { pages, numPages, fullText } = await extractTextOnly(file, onProgress)
 
-  if (onProgress) onProgress(45, 'Detecting examination type...')
+  if (onProgress) onProgress(52, 'Detecting examination...')
+  await yieldToUI()
   const detectedExamId = detectExam(fullText)
 
-  if (onProgress) onProgress(50, 'Extracting questions...')
-  const { questions, warnings } = extractQuestions(pages, onProgress)
+  if (onProgress) onProgress(55, 'Extracting Directions & passages...')
+  await yieldToUI()
+  const passages = extractDirections(fullText, pages)
 
-  if (onProgress) onProgress(85, 'Looking for answer key...')
+  if (onProgress) onProgress(58, 'Extracting questions...')
+  await yieldToUI()
+  const { questions, warnings } = extractQuestions(pages, fullText, passages, onProgress)
+
+  if (onProgress) onProgress(82, 'Extracting answer key...')
+  await yieldToUI()
   const { answerKey, found: answerKeyFound } = extractAnswerKey(pages)
 
-  // Apply answer key
+  let matched = 0
   if (answerKeyFound) {
     for (const q of questions) {
       if (answerKey[q.number]) {
         q.correctAnswer = answerKey[q.number]
+        matched++
       }
     }
-    warnings.push(
-      `Answer key detected: ${Object.keys(answerKey).length} answers matched.`
-    )
+    warnings.push(`Answer key: ${matched}/${questions.length} answer(s) matched.`)
   } else {
-    warnings.push('No answer key was detected. You can enter answers manually.')
+    warnings.push('No answer key detected. Enter answers manually in the builder.')
   }
 
-  // Detect title
-  const titleMatch = fullText.match(
-    /(?:SBI|IBPS|SSC)\s+(?:Clerk|PO|CGL|RRB|SO)[^\n]{0,40}/i
-  )
-  const title = titleMatch ? titleMatch[0].trim() : null
+  const titleMatch =
+    fullText.match(/SBI\s+Clerk[^\n]{0,60}/i) ||
+    fullText.match(/IBPS\s+(?:Clerk|PO|RRB)[^\n]{0,60}/i) ||
+    fullText.match(/SSC\s+CGL[^\n]{0,40}/i)
 
   if (onProgress) onProgress(100, 'Done')
 
   return {
-    title,
+    title: titleMatch ? titleMatch[0].trim() : null,
     detectedExamId,
     numPages,
     questions,
+    passages,
+    images: [],
     warnings,
     answerKeyFound,
     rawPageCount: numPages,

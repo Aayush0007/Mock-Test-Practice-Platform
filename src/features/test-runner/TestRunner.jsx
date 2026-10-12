@@ -12,6 +12,7 @@ import Modal from '../../components/ui/Modal'
 import TestHeader from './components/TestHeader'
 import QuestionPanel from './components/QuestionPanel'
 import QuestionPalette from './components/QuestionPalette'
+import SharedContentPanel from './components/SharedContentPanel'
 import { useTestTimer } from './hooks/useTestTimer'
 import { useActivityMonitor } from './hooks/useActivityMonitor'
 import { useTestStore } from '../../stores/testStore'
@@ -163,16 +164,49 @@ export default function TestRunner() {
   const isFirst = currentQuestionIndex === 0
   const isLast = currentQuestionIndex === sectionQuestions.length - 1
 
-  return (
-    <div className="h-screen flex flex-col exam-mode bg-slate-100">
-      <TestHeader remaining={remaining} isWarning={isWarning} />
+  const candidateName = 'Practice Candidate'
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left panel — shared content placeholder */}
-        <div className="hidden lg:flex w-2/5 border-r border-slate-200 bg-white p-4 overflow-y-auto">
-          <div className="text-sm text-slate-400 text-center w-full pt-20">
-            Shared content (passages, charts, diagrams) will appear here when associated with questions.
-          </div>
+  return (
+    <div className="h-screen flex flex-col exam-mode bg-slate-100 relative">
+      {/* Watermark like real CBT */}
+      <div
+        className="pointer-events-none absolute inset-0 z-0 overflow-hidden"
+        aria-hidden="true"
+      >
+        <div
+          className="absolute inset-0 opacity-[0.04]"
+          style={{
+            backgroundImage: `repeating-linear-gradient(
+              -25deg,
+              transparent,
+              transparent 80px,
+              currentColor 80px,
+              currentColor 81px
+            )`,
+          }}
+        />
+        <div className="absolute inset-0 flex flex-wrap content-around justify-around opacity-[0.06] select-none">
+          {Array.from({ length: 12 }).map((_, i) => (
+            <span
+              key={i}
+              className="text-2xl font-bold text-slate-900 rotate-[-25deg] m-8"
+            >
+              {candidateName}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <TestHeader
+        remaining={remaining}
+        isWarning={isWarning}
+        candidateName={candidateName}
+      />
+
+      <div className="flex-1 flex overflow-hidden relative z-10">
+        {/* Left panel — passages, DI charts, diagrams */}
+        <div className="hidden lg:flex w-2/5 border-r border-slate-200 bg-white overflow-hidden">
+          <SharedContentPanel />
         </div>
 
         {/* Right panel — question + controls */}
